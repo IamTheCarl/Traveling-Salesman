@@ -120,31 +120,31 @@ fn load_states(path: &str) -> Result<HashMap<u32, StateNode>, std::io::Error> {
 }
 
 fn get_start_and_end(states: &HashMap<u32, StateNode>) -> (&StateNode, &StateNode) {
-    let mut california: Option<&StateNode> = None;
-    let mut maine: Option<&StateNode> = None;
+    let mut start_state: Option<&StateNode> = None;
+    let mut end_state: Option<&StateNode> = None;
 
     for (_index, state) in states.iter() {
         if state.name == "WA" {
-            california = Some(state);
+            start_state = Some(state);
 
-            if maine.is_some() {
+            if end_state.is_some() {
                 break;
             }
         }
 
         if state.name == "ME" {
-            maine = Some(state);
+            end_state = Some(state);
 
-            if california.is_some() {
+            if start_state.is_some() {
                 break;
             }
         }
     }
 
-    let california = california.expect("Starting point California could not be found.");
-    let maine = maine.expect("Ending point Maine could not be found.");
+    let start_state = start_state.expect("Starting point California could not be found.");
+    let end_state = end_state.expect("Ending point Maine could not be found.");
 
-    (california, maine)
+    (start_state, end_state)
 }
 
 fn main() {
@@ -153,11 +153,11 @@ fn main() {
     //let mut paths = Vec::new();
     let queue = Arc::new(Mutex::new(Vec::new()));
 
-    let (california, maine) = get_start_and_end(&state_map);
+    let (start_state, end_state) = get_start_and_end(&state_map);
     // We start our journey in California.
     queue.lock().unwrap().push(Path {
         state_map: state_map.clone(),
-        states: vec![california.id],
+        states: vec![start_state.id],
         length: 0
     });
 
@@ -194,7 +194,7 @@ fn main() {
                             let end = state_map.get(&end_index).unwrap();
 
                             // Another path to go down.
-                            if end_index != maine.id {
+                            if end_index != end_state.id {
                                 println!("CHECK: {}", path);
                                 let mut new_searches = Vec::new();
                                 let shortest_length = shortest_path_length.lock().unwrap();
