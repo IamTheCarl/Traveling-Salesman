@@ -1,0 +1,10 @@
+[package]
+name = "traveling_sales_man"
+version = "0.1.0"
+authors = ["I am the Carl <jamescarl96@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+csv = "1.1"
+crossbeam = "0.7.1"
+num_cpus = "0.2"
