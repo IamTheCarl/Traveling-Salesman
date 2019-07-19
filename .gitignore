@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 .idea/*
+loud_log.txt
+paths_stack
+solutions.txt

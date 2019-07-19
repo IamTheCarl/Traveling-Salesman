@@ -1,63 +1,270 @@
 
 extern crate csv;
-extern crate crossbeam;
 extern crate num_cpus;
+extern crate byteorder;
 
 use std::fs::File;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::mpsc;
-use crossbeam::thread;
 use std::sync::Arc;
 use core::fmt;
 use std::fmt::Formatter;
 use std::cmp::Ordering;
+use crossbeam::thread;
+use crossbeam_channel::unbounded;
+use core::cmp;
+use std::io::{BufWriter, Write};
+use crossbeam_channel::bounded;
+use std::fs::OpenOptions;
+use byteorder::{ReadBytesExt, WriteBytesExt, NativeEndian};
+use std::io::SeekFrom;
+use std::io::Seek;
+use std::path::Path;
+use std::collections::vec_deque::VecDeque;
+use crossbeam_channel::Receiver;
 
 const CSV_FILE: &'static str = "dataset.csv";
 
 struct StateNode {
     name: String,
-    id: u32, // We use integers here so we can do the compares and lookups faster.
+    id: u8, // We use integers here so we can do the compares and lookups faster.
     connections: Vec<StateConnection>
 }
 
 #[derive(Clone)]
 struct StateConnection {
     distance: u32,
-    target: u32
+    target: u8
 }
 
-struct Path {
-    state_map: Arc<HashMap<u32, StateNode>>,
-    states: Vec<u32>,
+#[derive(Clone)]
+struct TravelPath {
+    state_map: Arc<HashMap<u8, StateNode>>,
+    states: Vec<u8>,
     length: u32
 }
 
-impl Path {
-    fn get_end(&self) -> u32 {
+impl TravelPath {
+    fn get_end(&self) -> u8 {
         self.states[self.states.len() - 1]
+    }
+
+    fn get_count_of_state(&self, state_to_count: u8) -> u32 {
+        let mut count = 0;
+
+        for state in self.states.iter() {
+            if *state == state_to_count {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    fn has_a_double_repeat(&self) -> bool {
+        let mut states = self.states.clone();
+        states.sort();
+        states.dedup();
+
+        let mut num_dups = 0;
+
+        for state in states {
+            if self.get_count_of_state(state) > 1 {
+                num_dups += 1;
+                if num_dups >= 2 {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
-impl fmt::Display for Path {
+impl fmt::Display for TravelPath {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "states {}, length {} ", self.states.len(), self.length)?;
+
         for state in self.states.iter() {
             let state = self.state_map.get(state).unwrap();
 
             write!(f, "{}->", state.name)?;
         }
 
-        write!(f, "END, states {}, length {}", self.states.len(), self.length )
+        write!(f, "END")
     }
 }
 
-fn load_states(path: &str) -> Result<HashMap<u32, StateNode>, std::io::Error> {
+impl PartialOrd for TravelPath {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(other.cmp(self))
+    }
+}
+
+impl Ord for TravelPath {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        let count_a = self.get_count_of_state(self.get_end());
+        let count_b = other.get_count_of_state(other.get_end());
+
+        let freq = count_b.cmp(&count_a);
+
+        if freq == Ordering::Less {
+            Ordering::Greater
+        } else {
+            self.length.cmp(&other.length)
+        }
+    }
+}
+
+impl PartialEq for TravelPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl std::cmp::Eq for TravelPath {
+
+}
+
+struct PathStack {
+    file: File,
+    count: usize,
+    state_map: Arc<HashMap<u8, StateNode>>,
+    cache: VecDeque<TravelPath>
+}
+
+impl PathStack {
+    fn new(state_map: &Arc<HashMap<u8, StateNode>>, path: &Path) -> Self {
+
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .expect("Unable to open path stack file");
+
+        Self {
+            file,
+            count: 0,
+            state_map: Arc::clone(state_map),
+            cache: VecDeque::new()
+        }
+    }
+
+    fn push(&mut self, path: TravelPath) {
+        self.cache.push_front(path);
+
+        let mut len = self.cache.len();
+
+        if len > 1000000 {
+            print!("Storing memory to hard drive...");
+
+            while len > 500000 {
+                let to_store = self.cache.pop_back().unwrap();
+                self.push_to_file(to_store);
+
+                len = self.cache.len();
+            }
+
+            self.cache.shrink_to_fit();
+
+            println!("Done.");
+        }
+    }
+
+    fn push_to_file(&mut self, path: TravelPath) {
+        // println!("PUSH: {}", path);
+
+        self.file.write_u32::<NativeEndian>(path.length).unwrap();
+
+        for state in path.states.iter() {
+            self.file.write_u8(*state).unwrap();
+        }
+
+        self.file.write_u16::<NativeEndian>(path.states.len() as u16).unwrap();
+
+        self.count += 1;
+    }
+
+    fn pop(&mut self) -> Option<TravelPath> {
+        let result = self.cache.pop_front();
+
+        let mut len = self.cache.len();
+        if len < 2000 {
+            let mut read_message = false;
+
+            while len < 50000 {
+                let from_file = self.pop_from_file();
+                match from_file {
+                    Some(path) => {
+                        if !read_message {
+                            print!("Reading memory from hard drive...");
+                            read_message = true;
+                        }
+
+                        self.cache.push_back(path)
+                    },
+                    None => break
+                };
+                len = self.cache.len();
+            }
+
+            if read_message {
+                println!("Done.");
+            }
+        }
+
+        result
+    }
+
+    fn pop_from_file(&mut self) -> Option<TravelPath> {
+        if self.count > 0 {
+            let mut file = &self.file;
+
+            let mut states = Vec::new();
+
+            file.seek(SeekFrom::Current(-2)).unwrap();
+            let num_states = file.read_u16::<NativeEndian>().unwrap();
+            file.seek(SeekFrom::Current(-(num_states as i64) - 2)).unwrap();
+
+            for _n in 0..num_states {
+                let state = file.read_u8().unwrap();
+                states.push(state);
+            }
+
+            file.seek(SeekFrom::Current(-(num_states as i64) - 4)).unwrap();
+            let length = file.read_u32::<NativeEndian>().unwrap();
+            file.seek(SeekFrom::Current(-4)).unwrap();
+
+            self.count -= 1;
+
+            let path = TravelPath {
+                state_map: Arc::clone(&self.state_map),
+                states,
+                length
+            };
+
+            // println!("POP: {}", path);
+
+            Some(path)
+
+        } else {
+            None
+        }
+    }
+}
+
+fn load_states(path: &str) -> Result<HashMap<u8, StateNode>, std::io::Error> {
     use std::io::Error;
     use std::io::ErrorKind;
 
     let mut map = HashMap::new();
     let mut state_name_map = HashMap::new();
-    let mut next_state_index = 0;
+    let mut next_state_index: u8 = 0;
 
     let file = File::open(path)?;
     let mut rdr = csv::Reader::from_reader(file);
@@ -119,7 +326,7 @@ fn load_states(path: &str) -> Result<HashMap<u32, StateNode>, std::io::Error> {
     Ok(map)
 }
 
-fn get_start_and_end(states: &HashMap<u32, StateNode>) -> (&StateNode, &StateNode) {
+fn get_start_and_end(states: &HashMap<u8, StateNode>) -> (&StateNode, &StateNode) {
     let mut start_state: Option<&StateNode> = None;
     let mut end_state: Option<&StateNode> = None;
 
@@ -148,169 +355,199 @@ fn get_start_and_end(states: &HashMap<u32, StateNode>) -> (&StateNode, &StateNod
 }
 
 fn main() {
+    let num_threads = num_cpus::get();
+    // let num_threads = 1;
+
     let state_map = Arc::new(load_states(CSV_FILE).unwrap());
 
-    //let mut paths = Vec::new();
-    let queue = Arc::new(Mutex::new(Vec::new()));
-
     let (start_state, end_state) = get_start_and_end(&state_map);
-    // We start our journey in California.
-    queue.lock().unwrap().push(Path {
-        state_map: state_map.clone(),
+
+    // Can use RAM or hard drive. This thing eats up RAM fast so I use the hard drive.
+    let stack = Arc::new(Mutex::new(PathStack::new(&state_map, Path::new("paths_stack"))));
+    // let stack = Arc::new(Mutex::new(Vec::new()));
+
+    //let (path_sender, paths) = unbounded();
+    let (path_sender, path_processor_receiver) = bounded(5000);
+    let (path_processor_sender, path_receiver) = bounded(5000);
+    let (log_sender, log_receiver) = bounded(5);
+    let (solution_sender, solution_receiver) = bounded(0);
+
+    stack.lock().unwrap().push(TravelPath {
+        state_map: Arc::clone(&state_map),
         states: vec![start_state.id],
         length: 0
     });
 
-    // Used to safely store found paths.
-    let (out, path_found) = mpsc::channel();
-
-    let num_threads = num_cpus::get();
-    // let num_threads = 4;
-
-    // This is the length of a random path I manually calculated.
-    // let shortest_path_length = Arc::new(Mutex::new(13911));
-    let shortest_path_length = Arc::new(Mutex::new(0xFFFFFFFF));
-
-
-    // We spawn one thread per core.
     thread::scope(|s| {
-        for i in 0..num_threads {
-            let queue = Arc::clone(&queue);
-            let state_map = Arc::clone(&state_map);
-            let shortest_path_length = Arc::clone(&shortest_path_length);
-            let out = out.clone();
+
+        let path_processor_sender = path_processor_sender.clone();
+        let path_processor_receiver = path_processor_receiver.clone();
+
+        {
+            let stack = Arc::clone(&stack);
+
             s.spawn(move |_| {
-                println!("Spawn thread {}.", i);
-                loop {
-                    // We pop from the front to keep memory usage low.
-                    let mut queue_copy = Vec::new();
-                    queue_copy.append(&mut queue.lock().unwrap());
+                println!("Collection thread started.");
 
-                    let path = queue_copy.pop();
-                    match path {
-                        Some(path) => {
-                            let states = &path.states;
-                            let end_index = *states.get(states.len() - 1).unwrap();
-                            let end = state_map.get(&end_index).unwrap();
-
-                            // Another path to go down.
-                            if end_index != end_state.id {
-                                println!("CHECK: {}", path);
-                                let mut new_searches = Vec::new();
-                                let shortest_length = shortest_path_length.lock().unwrap();
-
-                                // We want to try states we haven't tried yet first, so we're going to sort this.
-                                fn get_count(states: &Vec<u32>, state_to_count: u32) -> u32 {
-                                    let mut count = 0;
-
-                                    for state in states {
-                                        if *state == state_to_count {
-                                            count += 1;
-                                        }
-                                    }
-
-                                    count
-                                }
-
-                                let mut connections = end.connections.clone();
-                                // println!("NUM CONNECTIONS: {}", connections.len());
-
-                                connections.retain(|x| {
-                                    get_count(states, x.target) <= 2
-                                });
-
-                                connections.sort_by(|a, b| {
-                                    let count_a = get_count(states, a.target);
-                                    let count_b = get_count(states, b.target);
-
-                                    // println!("{} count: {} distance: {}", state_map.get(&a.target).unwrap().name, count_a, a.distance);
-
-                                    let freq = count_b.cmp(&count_a);
-
-                                    if freq != Ordering::Equal {
-                                        freq
-                                    } else {
-                                        b.distance.cmp(&a.distance)
-                                    }
-                                });
-
-                                for con in connections.iter() {
-                                    let count_a = get_count(states, con.target);
-                                    println!("{} count: {} distance: {}", state_map.get(&con.target).unwrap().name, count_a, con.distance);
-                                }
-
-                                for dest in connections.iter() {
-                                    let state = dest.target;
-                                    let length = path.length + dest.distance;
-
-                                    // Not a repeat state. We're good to go through here.
-                                    if length < *shortest_length {
-                                        new_searches.push(Path {
-                                            state_map: state_map.clone(),
-                                            states: {
-                                                let mut val = states.clone();
-                                                val.push(state);
-                                                val
-                                            },
-                                            length
-                                        });
-                                    }
-                                }
-
-                                // Keep this locked for as short a time as possible.
-                                if !new_searches.is_empty() {
-                                    let mut queue = queue.lock().unwrap();
-                                    queue.append(&mut new_searches);
-                                }
-                            } else { // We could have a path here.
-                                // Definatly possible.
-                                if path.states.len() >= state_map.len() {
-                                    let mut good = true;
-
-                                    // Each state must be in the path at least once.
-                                    for (id, _node) in state_map.iter() {
-                                        if !path.states.contains(id) {
-                                            good = false;
-                                            // println!("REJECT: {}\nMISSING: {}", path, _node.name);
-                                            break;
-                                        }
-                                    }
-
-                                    // This is a valid path.
-                                    if good {
-                                        out.send(path).unwrap();
-                                    }
-
-                                }
-                            }
-                        },
-                        None => break
-                    }
-
-                    std::thread::sleep(std::time::Duration::new(1, 0));
+                for path in path_processor_receiver {
+                    stack.lock().unwrap().push(path);
                 }
 
-                println!("End thread {}.", i);
+                println!("Collection thread finished.");
             });
         }
 
-        let shortest_path_length = Arc::clone(&shortest_path_length);
+        {
+            let stack = Arc::clone(&stack);
+
+            s.spawn(move |_| {
+                println!("Distribution thread started.");
+
+                loop {
+                    let path = stack.lock().unwrap().pop();
+                    match path {
+                        Some(path) => {
+                            path_processor_sender.send(path).unwrap();
+                        },
+                        None => {
+                            // TODO shutdown the application?
+                            // break;
+                        }
+                    }
+                }
+
+                println!("Distribution thread finished.");
+            });
+        }
+
+        let solution_receiver: Receiver<TravelPath> = solution_receiver.clone();
 
         // Acquisition thread.
         s.spawn(move |_| {
             println!("Acquisition thread started.");
 
-            for path in path_found {
-                println!("FOUND: {}", path);
-                let mut shortest_length = shortest_path_length.lock().unwrap();
+            let file = File::create("./solutions.txt").unwrap();
+            let mut file_writer = BufWriter::new(&file);
 
-                if path.length < *shortest_length {
-                    *shortest_length = path.length;
+            //let stdout = std::io::stdout();
+            //let mut stdout_writer = stdout.lock();
+
+            let mut shortest: u32 = 0xFFFFFFFF;
+
+            for path in solution_receiver {
+                if path.length < shortest {
+                    shortest = path.length;
+
+                    writeln!(file_writer, "Solution: {}", path).unwrap();
+                    file_writer.flush().unwrap();
+                    println!("Solution: {}", path);
                 }
             }
 
-            println!("Aquisition thread finished.");
+            println!("Acquisition thread finished.");
         });
+
+        let log_receiver = log_receiver.clone();
+
+        // Logger thread.
+        s.spawn(move |_| {
+            println!("Logger thread started.");
+
+            let file = File::create("./loud_log.txt").unwrap();
+            let mut writer = BufWriter::new(&file);
+
+            let mut line_count = 0;
+
+            for path in log_receiver {
+                if line_count >= 100000 {
+                    writeln!(writer, "Failed path: {}", path).unwrap();
+                    // println!("Failed path: {}", path);
+
+                    writer.flush().unwrap();
+                    line_count = 0;
+                } else {
+                    line_count += 1;
+                }
+            }
+
+            println!("Logger thread finished.");
+        });
+
+        // We spawn one thread per core.
+        for i in 0..num_threads {
+
+            let path_receiver = path_receiver.clone();
+            let path_sender = path_sender.clone();
+            let log_sender = log_sender.clone();
+            let solution_sender = solution_sender.clone();
+            let state_map = Arc::clone(&state_map);
+
+            s.spawn(move |_| {
+                println!("Start worker thread {}.", i);
+
+                for path in path_receiver {
+                    // log_sender.send(path.clone()).unwrap();
+                    // solution_sender.send(path.clone()).unwrap();
+
+                    if path.get_end() != end_state.id {
+                        // println!("Path: {}", path);
+                        if !log_sender.is_full() {
+                            log_sender.send(path.clone()).unwrap();
+                        }
+
+                        let connections = &state_map.get(&path.get_end()).unwrap().connections;
+
+                        let mut new_searches = Vec::new();
+
+                        for dest in connections.iter() {
+                            let state = dest.target;
+                            let length = path.length + dest.distance;
+
+                            // Not a repeat state. We're good to go through here.
+                            new_searches.push(TravelPath {
+                                state_map: Arc::clone(&state_map),
+                                states: {
+                                    let mut val = path.states.clone();
+                                    val.push(state);
+                                    val
+                                },
+                                length: length
+                            });
+
+                            new_searches.retain(|x| {
+                                x.get_count_of_state(x.get_end()) <= 2
+                                    && !x.has_a_double_repeat()
+                            });
+
+                            new_searches.sort();
+                        }
+
+                        for path in new_searches {
+                            path_sender.send(path).unwrap();
+                        }
+                    } else {
+                        // This could be the end but we need to check that all states have been visited.
+
+                        // Definatly possible.
+                        let mut good = true;
+
+                        // Each state must be in the path at least once.
+                        for (id, _node) in state_map.iter() {
+                            if !path.states.contains(id) {
+                                good = false;
+                                break;
+                            }
+                        }
+
+                        if good {
+                            solution_sender.send(path).unwrap();
+                        }
+                    }
+                }
+
+                println!("End thread {}.", i);
+            });
+        }
     }).unwrap();
 }
 
