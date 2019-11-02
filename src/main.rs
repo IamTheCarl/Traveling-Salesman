@@ -11,7 +11,6 @@ use core::fmt;
 use std::fmt::Formatter;
 use std::cmp::Ordering;
 use crossbeam::thread;
-use crossbeam_channel::unbounded;
 use core::cmp;
 use std::io::{BufWriter, Write};
 use crossbeam_channel::bounded;
@@ -416,7 +415,7 @@ fn main() {
                     }
                 }
 
-                println!("Distribution thread finished.");
+                // println!("Distribution thread finished.");
             });
         }
 
@@ -515,7 +514,7 @@ fn main() {
                             });
 
                             new_searches.retain(|x| {
-                                x.get_count_of_state(x.get_end()) <= 2
+                                x.get_count_of_state(x.get_end()) <= 1
                                     && !x.has_a_double_repeat()
                             });
 
